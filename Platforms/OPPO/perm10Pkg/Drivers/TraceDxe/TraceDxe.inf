@@ -1,0 +1,25 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = TraceDxe
+  FILE_GUID                      = 7B1E4C52-9C4E-4E31-A0B7-2F1D0C9A5E11
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = TraceDxeEntryPoint
+
+[Sources]
+  TraceDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+  QcomPkg/QcomPkg.dec
+  ArmPkg/ArmPkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  MemoryMapHelperLib
+  ArmSmcLib
+  BaseMemoryLib
+
+[Depex]
+  TRUE

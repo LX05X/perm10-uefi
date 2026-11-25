@@ -1,0 +1,8 @@
+[Defines]
+  DEC_SPECIFICATION              = 0x00010005
+  PACKAGE_NAME                   = perm10Pkg
+  PACKAGE_GUID                   = 4A6E8D25-4FD7-4B52-B2B1-22831A210750
+  PACKAGE_VERSION                = 0.1
+
+[Includes]
+  Include
