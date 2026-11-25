@@ -1,0 +1,192 @@
+name: Build PERM10 UEFI
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: 'EDK2 build target'
+        type: choice
+        options: [DEBUG, RELEASE]
+        default: DEBUG
+      fd_base:
+        description: 'Override uefi_fd.base, e.g. 0x9FC41000 (empty = use perm10.toml)'
+        default: ''
+      fd_size:
+        description: 'Override uefi_fd.size, e.g. 0x2BF000 (empty = use perm10.toml)'
+        default: ''
+      header_version:
+        description: 'Android boot header version override (empty = use perm10.toml)'
+        default: ''
+      halt_level:
+        description: 'SEC halt stage: 0 off, 1 entry, 2 after memory, 3 after PlatformPeim, 4 after FV'
+        default: '0'
+  push:
+    branches:
+      - perm10
+  pull_request:
+    paths:
+      - 'Platforms/OPPO/perm10Pkg/**'
+      - 'Resources/Configs/perm10.toml'
+      - '.github/workflows/perm10-build.yml'
+      - 'ci/**'
+
+concurrency:
+  group: perm10-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_MODE: ${{ inputs.build_mode || 'DEBUG' }}
+
+jobs:
+  audit:
+    name: Offline audits
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Apply port patch when the package is not committed
+        run: |
+          if [ ! -d Platforms/OPPO/perm10Pkg ]; then
+            git apply --verbose ci/perm10-port.patch
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Static audits that need no capture
+        run: |
+          set -euo pipefail
+          python -m py_compile Platforms/OPPO/perm10Pkg/*.py
+          python Platforms/OPPO/perm10Pkg/generate_memory_map.py
+          python Platforms/OPPO/perm10Pkg/generate_configuration_map.py
+          git diff --exit-code -- Platforms/OPPO/perm10Pkg/Library
+          python Platforms/OPPO/perm10Pkg/audit_donor_pil.py \
+            Platforms/OPPO/perm10Pkg/Resources/Reference/spacewar-uefipil.cfg
+          python Platforms/OPPO/perm10Pkg/extract_dtb.py --verify Resources/DTBs/perm10.dtb
+          python Platforms/OPPO/perm10Pkg/check_linux_dts.py
+          python Platforms/OPPO/perm10Pkg/audit_build_refs.py
+
+  build:
+    name: EDK2 build
+    runs-on: ubuntu-22.04
+    needs: audit
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Apply port patch when the package is not committed
+        run: |
+          if [ ! -d Platforms/OPPO/perm10Pkg ]; then
+            git apply --verbose ci/perm10-port.patch
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply FD placement override
+        if: inputs.fd_base != '' && inputs.fd_size != ''
+        run: |
+          sed -i "s|^base = .*|base = ${{ inputs.fd_base }}|" Resources/Configs/perm10.toml
+          sed -i "s|^size = .*|size = ${{ inputs.fd_size }}|" Resources/Configs/perm10.toml
+          grep -A2 '^\[uefi_fd\]' Resources/Configs/perm10.toml
+
+      - name: Apply boot header override
+        if: inputs.header_version != ''
+        run: |
+          sed -i "s|^header_version = .*|header_version = ${{ inputs.header_version }}|" \
+            Resources/Configs/perm10.toml
+          grep -n 'header_version' Resources/Configs/perm10.toml
+
+      - name: Apply SEC halt level
+        if: inputs.halt_level != ''
+        run: |
+          sed -i "s|-DPERM10_HALT_LEVEL=[0-9]*|-DPERM10_HALT_LEVEL=${{ inputs.halt_level }}|" \
+            Platforms/OPPO/perm10Pkg/perm10.dsc
+          grep -n 'PERM10_HALT_LEVEL' Platforms/OPPO/perm10Pkg/perm10.dsc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev nasm acpica-tools device-tree-compiler \
+            clang lld llvm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            git python3-dev
+
+      - name: Fetch submodules
+        run: |
+          set -euo pipefail
+          git submodule update --init --recursive --depth 1 -- \
+            Binaries Common/Mu Common/Mu_OEM_Sample Mu_Basecore \
+            Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl
+          # Mu-Silicium pins a Silicium-ACPI commit that upstream has dropped
+          # (6d549329). ACPI is disabled in perm10Pkg, so main is acceptable.
+          if ! git submodule update --init --depth 1 Silicium-ACPI; then
+            git -C Silicium-ACPI fetch --depth 1 origin main
+            git -C Silicium-ACPI checkout FETCH_HEAD
+          fi
+
+      - name: Verify build references against fetched modules
+        run: python Platforms/OPPO/perm10Pkg/audit_build_refs.py --require
+
+      - name: Install Python requirements
+        run: python -m pip install --upgrade pip && python -m pip install -r pip-requirements.txt
+
+      - name: Build perm10
+        run: |
+          set -o pipefail
+          echo "build mode: $BUILD_MODE"
+          python build_uefi.py -d perm10 -r "$BUILD_MODE" 2>&1 | tee build-perm10.log
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/image artifact/tree
+          cp -v build-perm10.log artifact/image/ || true
+          cp -v Mu-perm10*.bin artifact/image/ 2>/dev/null || true
+          cp -v Mu-perm10*.img artifact/image/ 2>/dev/null || true
+          for img in Mu-perm10*.img; do
+            [ -f "$img" ] || continue
+            python Platforms/OPPO/perm10Pkg/check_boot_img.py "$img" \
+              --driver-dir Binaries/spacewar/QcomPkg/Drivers | tee artifact/image/boot-img-check.txt
+            sha256sum "$img" | tee artifact/image/Mu-perm10.img.sha256
+          done
+          if [ -f Build/perm10Pkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd ]; then
+            fd=Build/perm10Pkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd
+            size=$(stat -c %s "$fd")
+            sha256sum "$fd" | tee artifact/image/SILICIUM_UEFI.fd.sha256
+            echo "FD size: $size bytes"
+            configured=$(sed -n '/^\[uefi_fd\]/,/^$/s/^size = //p' Resources/Configs/perm10.toml)
+            expected=$((configured))
+            if [ "$size" -ne "$expected" ]; then
+              echo "::error::FD size $size does not match the configured FD size $configured"
+              exit 1
+            fi
+            cp -v "$fd" artifact/image/
+          fi
+          if [ -d Build ]; then tar -czf artifact/tree/perm10-build.tar.gz Build; fi
+
+      - name: Upload flashable image
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perm10-image-${{ env.BUILD_MODE }}-${{ github.run_number }}
+          path: artifact/image
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload build tree
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perm10-tree-${{ env.BUILD_MODE }}-${{ github.run_number }}
+          path: artifact/tree
+          if-no-files-found: warn
+          retention-days: 7
